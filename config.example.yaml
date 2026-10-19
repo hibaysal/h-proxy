@@ -1,0 +1,35 @@
+# h_proxy example configuration
+#
+# Each listener accepts connections on `listen` and forwards them to a single
+# `backend`. The backend sees the proxy's own IP as the source address.
+
+# Optional global tuning (these are the defaults):
+connect_timeout: 10        # seconds to wait when dialling a backend
+buffer_size: 65536         # bytes per read in raw forwarding
+# idle_timeout: 300        # seconds of silence before a connection is dropped
+# max_header_bytes: 1048576  # cap on an HTTP request/response head
+# max_connections: 1000    # cap on concurrent connections (soft; default unlimited)
+
+listeners:
+  # HTTP reverse proxy: adds X-Forwarded-For / X-Real-IP / X-Forwarded-Proto.
+  - name: web
+    mode: http
+    listen: "0.0.0.0:8080"      # ":8080" also works (binds all interfaces)
+    backend: "127.0.0.1:8000"
+    forwarded_headers: true
+    # host: example.com         # optional: only serve this Host, else 404
+
+  # SSH (or any raw TCP): pure byte forwarding, no inspection.
+  - name: ssh
+    mode: tcp
+    listen: "0.0.0.0:2222"
+    backend: "127.0.0.1:22"
+
+  # Preserve the real client IP to the backend via the HAProxy PROXY protocol.
+  # The backend must be configured to accept it (nginx proxy_protocol, etc.).
+  - name: web-pp
+    mode: tcp
+    listen: "0.0.0.0:443"
+    backend: "10.0.0.10:443"
+    # send_proxy: v2            # false | v1 | v2
+    # source: 10.0.0.1         # bind outbound connections to this local IP
