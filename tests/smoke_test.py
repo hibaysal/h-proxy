@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from h_proxy import config as cfg
 from h_proxy.config import Config, ListenerConfig
 from h_proxy.http_proxy import HTTPProxy
+from h_proxy.socks_proxy import SOCKS5Proxy
 from h_proxy.tcp_proxy import TCPProxy
 
 PASSED = 0
@@ -134,6 +136,44 @@ async def port_of(server) -> int:
     return server.sockets[0].getsockname()[1]
 
 
+async def socks5_connect(proxy_host, proxy_port, dst_host, dst_port, auth=None):
+    """Minimal SOCKS5 client: negotiate, (optionally) auth, CONNECT to dst."""
+    r, w = await asyncio.open_connection(proxy_host, proxy_port)
+    w.write(bytes([0x05, 1, 0x02 if auth else 0x00]))
+    await w.drain()
+    _, method = await r.readexactly(2)
+    if auth:
+        if method != 0x02:
+            w.close()
+            raise AssertionError(f"server did not select user/pass (got 0x{method:02x})")
+        user, pw = auth
+        w.write(bytes([0x01, len(user)]) + user.encode() + bytes([len(pw)]) + pw.encode())
+        await w.drain()
+        _, status = await r.readexactly(2)
+        if status != 0x00:
+            w.close()
+            raise PermissionError("socks auth failed")
+    elif method != 0x00:
+        w.close()
+        raise AssertionError(f"server did not select no-auth (got 0x{method:02x})")
+
+    host_bytes = dst_host.encode()
+    w.write(bytes([0x05, 0x01, 0x00, 0x03, len(host_bytes)]) + host_bytes + struct.pack("!H", dst_port))
+    await w.drain()
+    _, rep, _, atyp = await r.readexactly(4)
+    if atyp == 0x01:
+        await r.readexactly(4)
+    elif atyp == 0x04:
+        await r.readexactly(16)
+    elif atyp == 0x03:
+        await r.readexactly((await r.readexactly(1))[0])
+    await r.readexactly(2)  # bound port
+    if rep != 0x00:
+        w.close()
+        raise ConnectionError(f"socks connect failed, rep=0x{rep:02x}")
+    return r, w
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -160,10 +200,16 @@ async def run() -> None:
         HTTPProxy(pp_lc, config).handle, "127.0.0.1", 0, limit=config.max_header_bytes
     )
     src_px = await asyncio.start_server(TCPProxy(src_lc, config).handle, "127.0.0.1", 0)
+    socks_lc = ListenerConfig("socks", "socks", "127.0.0.1", 0)
+    socks_auth_lc = ListenerConfig("socks-auth", "socks", "127.0.0.1", 0, socks_auth={"alice": "pw"})
+    socks_px = await asyncio.start_server(SOCKS5Proxy(socks_lc, config).handle, "127.0.0.1", 0)
+    socks_auth_px = await asyncio.start_server(SOCKS5Proxy(socks_auth_lc, config).handle, "127.0.0.1", 0)
     http_port = await port_of(http_px)
     tcp_port = await port_of(tcp_px)
     pp_port = await port_of(pp_px)
     src_port = await port_of(src_px)
+    socks_port = await port_of(socks_px)
+    socks_auth_port = await port_of(socks_auth_px)
 
     try:
         # 1. GET with forwarded headers -----------------------------------
@@ -240,8 +286,32 @@ async def run() -> None:
         echoed = await r.readexactly(len(b"src-bind-echo"))
         w.close()
         check(echoed == b"src-bind-echo", "source-bound TCP connection forwards")
+
+        # 9. SOCKS5 no-auth CONNECT ---------------------------------------
+        r, w = await socks5_connect("127.0.0.1", socks_port, "127.0.0.1", echo_be_port)
+        w.write(b"socks-no-auth")
+        await w.drain()
+        echoed = await r.readexactly(len(b"socks-no-auth"))
+        w.close()
+        check(echoed == b"socks-no-auth", "SOCKS5 no-auth CONNECT relays to the chosen target")
+
+        # 10. SOCKS5 username/password auth -------------------------------
+        r, w = await socks5_connect("127.0.0.1", socks_auth_port, "127.0.0.1", echo_be_port, auth=("alice", "pw"))
+        w.write(b"socks-authed")
+        await w.drain()
+        echoed = await r.readexactly(len(b"socks-authed"))
+        w.close()
+        check(echoed == b"socks-authed", "SOCKS5 relays after valid credentials")
+
+        # 11. SOCKS5 rejects bad credentials ------------------------------
+        rejected = False
+        try:
+            await socks5_connect("127.0.0.1", socks_auth_port, "127.0.0.1", echo_be_port, auth=("alice", "nope"))
+        except PermissionError:
+            rejected = True
+        check(rejected, "SOCKS5 rejects invalid credentials")
     finally:
-        for s in (http_px, tcp_px, pp_px, src_px, http_be, echo_be):
+        for s in (http_px, tcp_px, pp_px, src_px, socks_px, socks_auth_px, http_be, echo_be):
             s.close()
             await s.wait_closed()
 
@@ -250,7 +320,7 @@ def test_config_parser() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     example = os.path.join(os.path.dirname(here), "config.example.yaml")
     c = cfg.load(example)
-    check(len(c.listeners) == 3, "example config parses 3 listeners")
+    check(len(c.listeners) == 4, "example config parses 4 listeners")
     web = next(l for l in c.listeners if l.name == "web")
     check(web.mode == "http" and web.listen_port == 8080, "web listener parsed")
     check(web.backend_host == "127.0.0.1" and web.backend_port == 8000, "web backend parsed")
@@ -285,6 +355,24 @@ def test_config_parser() -> None:
     check(c2.max_connections == 100, "max_connections parsed")
     check(c2.listeners[0].send_proxy == "v2", "send_proxy parsed")
     check(c2.listeners[0].source == "10.0.0.5", "source parsed")
+
+    # SOCKS listener: no backend, optional auth map.
+    sk = cfg.loads(
+        "listeners:\n"
+        "  - name: s\n"
+        "    mode: socks\n"
+        '    listen: "127.0.0.1:1080"\n'
+        "    socks_auth:\n"
+        "      alice: pw\n"
+    )
+    check(sk.listeners[0].mode == "socks", "socks listener parsed")
+    check(sk.listeners[0].socks_auth == {"alice": "pw"}, "socks_auth mapping parsed")
+    rejected = False
+    try:
+        cfg.loads('listeners:\n  - name: s\n    mode: socks\n    listen: ":1080"\n    backend: "h:1"\n')
+    except cfg.ConfigError:
+        rejected = True
+    check(rejected, "socks mode rejects a 'backend'")
 
 
 def test_proxyproto() -> None:

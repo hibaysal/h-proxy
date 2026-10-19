@@ -1,9 +1,10 @@
 # h_proxy
 
-A small **pure-standard-library** TCP / HTTP proxy for Python 3.11+ — think of
-it as a tiny "haproxy-lite" that just forwards connections to a backend. Each
-listener accepts connections and forwards them to a single backend; the backend
-sees the proxy's own IP as the source address (the "SNAT" behaviour).
+A small **pure-standard-library** TCP / HTTP / SOCKS5 proxy for Python 3.11+ —
+think of it as a tiny "haproxy-lite". The `tcp` and `http` modes are reverse
+proxies (each listener forwards to one fixed backend, which sees the proxy's own
+IP as the source — the "SNAT" behaviour); the `socks` mode is a SOCKS5 forward
+proxy where the client picks the destination per connection.
 
 No third-party dependencies. No `pip install`. Just `asyncio` from the standard
 library. Runs on Linux, macOS, and Windows.
@@ -15,6 +16,12 @@ library. Runs on Linux, macOS, and Windows.
   headers: `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host`.
   Handles keep-alive, `Content-Length` and chunked bodies, `Expect: 100-continue`,
   and `Connection: Upgrade` (WebSocket) by splicing the connection raw after `101`.
+- **SOCKS5 mode** — a forward proxy (RFC 1928, CONNECT) where the client chooses
+  the destination: works for browsing *and* SSH and anything else TCP. Optional
+  username/password auth (RFC 1929); hostnames are resolved proxy-side (remote
+  DNS). No `backend` — the destination is dynamic.
+- **PROXY protocol** (`send_proxy: v1|v2`) and outbound **source-IP bind**
+  (`source:`) to preserve / steer the client address.
 - **YAML config** — parsed by a tiny built-in parser (a documented subset), so
   there's nothing to install.
 - Multiple listeners in one process; clean shutdown on Ctrl+C / `SIGTERM`.
@@ -114,6 +121,67 @@ Transparent proxying that spoofs the client IP at L4 (so the backend sees the
 client directly) would need root + Linux TPROXY and is out of scope; the PROXY
 protocol is the portable alternative.
 
+## Example: browse and SSH through one SSH reverse tunnel
+
+A SOCKS5 listener plus a single `ssh -R` reverse tunnel lets a remote machine
+reach *everything* on the proxy host's network — web and SSH alike — without a
+port-per-host.
+
+```
+  home browser / ssh ──socks5h──▶ homeserver:6969
+                                       │  ssh -R 6969:localhost:1080 homeserver
+                                       ▼            (run from the laptop)
+  laptop (runs h_proxy)  ── SOCKS5 127.0.0.1:1080 ──▶ VPN ──▶ data center / internet
+```
+
+On the **laptop** (which has the VPN), run h_proxy with just a SOCKS listener
+bound to localhost, then open the reverse tunnel:
+
+```yaml
+listeners:
+  - name: socks
+    mode: socks
+    listen: "127.0.0.1:1080"   # only reachable via the SSH tunnel -> SSH is the auth
+    # source: 10.8.0.2         # optional: force egress out the VPN interface
+```
+```bash
+ssh -R 6969:localhost:1080 homeserver   # expose the SOCKS proxy at homeserver:6969
+```
+
+At **home**:
+
+- **Firefox** → SOCKS v5 host `127.0.0.1` port `6969`, and tick *"Proxy DNS when
+  using SOCKS v5"* so names resolve inside the VPN.
+- **SSH** (no per-host tunnels needed) in `~/.ssh/config`:
+  ```sshconfig
+  Host dc-*
+      ProxyCommand ncat --proxy-type socks5 --proxy 127.0.0.1:6969 --proxy-dns remote %h %p
+      # or: ProxyCommand nc -X 5 -x 127.0.0.1:6969 %h %p
+  ```
+  Then `ssh dc-db01` tunnels straight through.
+
+Keep the tunnel resilient (auto-reconnect, and fail fast if the remote port is
+still held by a stale session):
+
+```bash
+autossh -M 0 -N -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -R 6969:localhost:1080 homeserver
+```
+
+By default `-R` binds `6969` to **loopback** on the home server, so only the home
+server itself can use it. To let other devices on the home LAN reach it, set
+`GatewayPorts clientspecified` in the home server's `sshd_config` and bind
+`-R 0.0.0.0:6969:localhost:1080` — and then set `socks_auth`, because the DC exit
+is now reachable by your whole LAN.
+
+Ready-to-copy versions of both halves live in [`examples/`](examples/):
+[`examples/ssh_config`](examples/ssh_config) for the home machine and
+[`examples/laptop-tunnel.sh`](examples/laptop-tunnel.sh) for the laptop.
+
+Because SOCKS can reach anything the laptop can, keep the listener on `127.0.0.1`
+(so only the authenticated SSH tunnel can use it), or set `socks_auth`, or use
+fixed `tcp` listeners instead when you want to restrict the reachable hosts.
+
 ## Testing
 
 ```bash
@@ -132,18 +200,24 @@ h_proxy/
   relay.py       # bidirectional raw byte pump (half-close aware)
   tcp_proxy.py   # raw TCP listener (SSH + anything)
   http_proxy.py  # HTTP/1.x-aware listener
+  socks_proxy.py # SOCKS5 forward-proxy listener
   proxyproto.py  # HAProxy PROXY protocol v1/v2 header builder
   server.py      # starts listeners, graceful shutdown
   __main__.py    # CLI entry point
 config.example.yaml
+examples/
+  ssh_config        # home-side ~/.ssh/config for SSH-over-SOCKS
+  laptop-tunnel.sh  # laptop-side autossh/ssh reverse-tunnel launcher
 tests/smoke_test.py
 ```
 
 ## Limitations
 
-- One backend per listener (no load balancing / health checks).
+- `tcp`/`http`: one backend per listener (no load balancing / health checks).
 - HTTP mode is a pragmatic HTTP/1.x forwarder, not a conformance-complete
   implementation; HTTP/2 is not supported (use `tcp` mode to pass TLS/h2 through
   opaquely).
 - Hop-by-hop header handling is minimal (the `Connection` header is managed; a
   full hop-by-hop strip is not performed).
+- SOCKS: SOCKS5 only, `CONNECT` only (no SOCKS4/4a, no `BIND`, no UDP
+  `ASSOCIATE`), and no per-destination allowlist yet.

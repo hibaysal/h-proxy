@@ -33,3 +33,13 @@ listeners:
     backend: "10.0.0.10:443"
     # send_proxy: v2            # false | v1 | v2
     # source: 10.0.0.1         # bind outbound connections to this local IP
+
+  # SOCKS5 forward proxy: the CLIENT chooses the destination (no backend).
+  # Bind to localhost when you reach it through an SSH tunnel -- SSH is then
+  # your authentication. Point clients at it with remote DNS (socks5h).
+  - name: socks
+    mode: socks
+    listen: "127.0.0.1:1080"
+    # socks_auth:              # optional RFC 1929 username: password
+    #   alice: "s3cret"        #   (quote values that look like numbers/bools)
+    # source: 10.8.0.2         # bind outbound to the VPN interface IP

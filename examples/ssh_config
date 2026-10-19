@@ -1,0 +1,42 @@
+# h_proxy — SSH to data-center hosts through the SOCKS5 reverse tunnel
+# ===========================================================================
+# Put this on the HOME machine: paste into ~/.ssh/config, or save it somewhere
+# and add `Include /path/to/this/file` at the top of ~/.ssh/config.
+#
+# It routes every `dc-*` host through the SOCKS5 proxy your laptop exposes at
+# the home end of the reverse tunnel:
+#
+#   ssh dc-db01  ->  ProxyCommand socks5 127.0.0.1:6969
+#                 ->  (ssh -R tunnel)  ->  laptop h_proxy SOCKS :1080  ->  DC / VPN
+#
+# See the project README ("browse and SSH through one SSH reverse tunnel") for
+# the full picture and the laptop-side command (examples/laptop-tunnel.sh).
+#
+# Needs a SOCKS-capable ProxyCommand helper, either:
+#   - ncat (from nmap):        --proxy-dns remote resolves names proxy-side
+#   - OpenBSD netcat (nc):     -X 5 selects SOCKS5
+# "proxy-side" DNS means names resolve on the LAPTOP, inside the VPN — the SSH
+# equivalent of Firefox's "Proxy DNS when using SOCKS v5".
+
+# --- routing rule: anything named dc-* goes through the tunnel's SOCKS proxy --
+Host dc-*
+    ProxyCommand ncat --proxy-type socks5 --proxy 127.0.0.1:6969 --proxy-dns remote %h %p
+    # OpenBSD netcat instead of ncat:
+    #ProxyCommand nc -X 5 -x 127.0.0.1:6969 %h %p
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+
+# --- aliases: `ssh dc-db01` connects to db01.dc.internal:22 as admin ---------
+# (dc-db01 matches the dc-* block above, so it inherits the ProxyCommand; the
+#  HostName is what actually gets resolved, proxy-side, inside the DC.)
+Host dc-db01
+    HostName db01.dc.internal
+    User admin
+
+Host dc-web01
+    HostName web01.dc.internal
+    User deploy
+
+# --- prefer real names? match the DC domain and `ssh db01.dc.internal` -------
+#Host *.dc.internal
+#    ProxyCommand ncat --proxy-type socks5 --proxy 127.0.0.1:6969 --proxy-dns remote %h %p

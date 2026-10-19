@@ -265,7 +265,7 @@ def parse_address(spec: Any, *, default_host: str | None, what: str) -> tuple[st
 # Config dataclasses
 # --------------------------------------------------------------------------- #
 
-VALID_MODES = ("tcp", "http")
+VALID_MODES = ("tcp", "http", "socks")
 
 
 @dataclass
@@ -274,14 +274,16 @@ class ListenerConfig:
     mode: str
     listen_host: str
     listen_port: int
-    backend_host: str
-    backend_port: int
+    backend_host: str = ""  # unused for socks mode (destination is dynamic)
+    backend_port: int = 0
     # http-only options
     forwarded_headers: bool = True
     host: str | None = None  # optional Host allow-value; others get 404
-    # L4 options (apply to both modes)
+    # L4 options (apply to tcp/http modes)
     send_proxy: str | None = None  # None | "v1" | "v2": PROXY protocol to backend
     source: str | None = None  # local source IP to bind outbound (haproxy 'source')
+    # socks-only options
+    socks_auth: dict | None = None  # username -> password (RFC 1929); None = no auth
 
     @property
     def listen_addr(self) -> str:
@@ -311,6 +313,7 @@ _KNOWN_LISTENER_KEYS = {
     "host",
     "send_proxy",
     "source",
+    "socks_auth",
 }
 _KNOWN_TOP_KEYS = {
     "listeners",
@@ -346,9 +349,16 @@ def _build_listener(raw: Any, index: int) -> ListenerConfig:
     listen_host, listen_port = parse_address(
         _require(raw, "listen", where), default_host="0.0.0.0", what=f"{where} listen"
     )
-    backend_host, backend_port = parse_address(
-        _require(raw, "backend", where), default_host=None, what=f"{where} backend"
-    )
+    if mode == "socks":
+        if raw.get("backend") is not None:
+            raise ConfigError(
+                f"{where}: socks mode takes no 'backend' (the client chooses the destination)"
+            )
+        backend_host, backend_port = "", 0
+    else:
+        backend_host, backend_port = parse_address(
+            _require(raw, "backend", where), default_host=None, what=f"{where} backend"
+        )
 
     forwarded = raw.get("forwarded_headers", True)
     if not isinstance(forwarded, bool):
@@ -369,12 +379,24 @@ def _build_listener(raw: Any, index: int) -> ListenerConfig:
         send_proxy = "v1"
     else:
         raise ConfigError(f"{where}: send_proxy must be one of false, v1, v2")
+    if send_proxy and mode == "socks":
+        raise ConfigError(f"{where}: send_proxy does not apply to socks mode")
 
     source = raw.get("source")
     if source is not None:
         source = str(source).strip()
         if not source:
             raise ConfigError(f"{where}: source must be a non-empty IP address")
+
+    socks_auth = raw.get("socks_auth")
+    if socks_auth is not None:
+        if mode != "socks":
+            raise ConfigError(f"{where}: socks_auth only applies to socks mode")
+        if not isinstance(socks_auth, dict) or not socks_auth:
+            raise ConfigError(
+                f"{where}: socks_auth must be a non-empty mapping of username: password"
+            )
+        socks_auth = {str(k): str(v) for k, v in socks_auth.items()}
 
     return ListenerConfig(
         name=name,
@@ -387,6 +409,7 @@ def _build_listener(raw: Any, index: int) -> ListenerConfig:
         host=host,
         send_proxy=send_proxy,
         source=source,
+        socks_auth=socks_auth,
     )
 
 

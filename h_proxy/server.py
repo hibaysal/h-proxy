@@ -12,6 +12,7 @@ import logging
 
 from .config import Config, ListenerConfig
 from .http_proxy import HTTPProxy
+from .socks_proxy import SOCKS5Proxy
 from .tcp_proxy import TCPProxy
 
 log = logging.getLogger("h_proxy.server")
@@ -20,6 +21,8 @@ log = logging.getLogger("h_proxy.server")
 def _make_proxy(listener: ListenerConfig, config: Config):
     if listener.mode == "http":
         return HTTPProxy(listener, config)
+    if listener.mode == "socks":
+        return SOCKS5Proxy(listener, config)
     return TCPProxy(listener, config)
 
 
@@ -49,10 +52,8 @@ async def serve(config: Config) -> None:
             wrap(proxy.handle), lc.listen_host, lc.listen_port, limit=limit
         )
         servers.append(server)
-        log.info(
-            "listener %r (%s): %s -> %s",
-            lc.name, lc.mode, lc.listen_addr, lc.backend_addr,
-        )
+        dest = "dynamic (client-chosen)" if lc.mode == "socks" else lc.backend_addr
+        log.info("listener %r (%s): %s -> %s", lc.name, lc.mode, lc.listen_addr, dest)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
